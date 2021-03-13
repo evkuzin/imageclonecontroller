@@ -1,0 +1,46 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: default-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: imageloader
+  labels:
+    app: imageloader
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: imageloader
+  template:
+    metadata:
+      labels:
+        app: imageloader
+    spec:
+      containers:
+        - name: imageloader
+          image: evkuzin/imageloader:latest
+          imagePullPolicy: Always
+          env:
+            - name: DATETIME
+              value: REPLACEME
+            - name: DOCKER_CONFIG
+              value: /.docker/
+          volumeMounts:
+            - name: docker-conf
+              mountPath: /.docker/
+      volumes:
+        - name: docker-conf
+          configMap:
+            name: docker-config
