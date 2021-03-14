@@ -58,7 +58,7 @@ spec:
     spec:
       containers:
         - name: imageloader
-          image: evkuzin/imageloader:latest
+          image: IMAGELOADER_IMAGE
           imagePullPolicy: Always
           env:
             - name: DATETIME

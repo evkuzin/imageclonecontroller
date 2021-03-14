@@ -4,9 +4,15 @@ and replace images with the new one from our location.
 
 
 To compile and run:
+- check manifests (I did tests with docker registry and it require auth, 
+so I added docker conf with auth, but you probbaly need different settings here)
+- by default, it will be created in default namespace
+- run
 
 ```shell
-CONTEXT=YOUR_K8S_CONTEXT make docker
+export IMAGELOADER=k8s.gcr.io/imageloader:latest
+export CONTEXT=YOUR_K8S_CONTEXT 
+make docker
 ```
 
 
