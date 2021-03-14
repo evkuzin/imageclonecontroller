@@ -2,7 +2,9 @@ package main
 
 import (
     "context"
+    "flag"
     "fmt"
+    "github.com/docker/distribution/uuid"
     "github.com/google/go-containerregistry/pkg/authn"
     "github.com/google/go-containerregistry/pkg/name"
     "github.com/google/go-containerregistry/pkg/v1/remote"
@@ -17,37 +19,60 @@ import (
     "strings"
 )
 
-func main() {
-    log.SetFormatter(&log.TextFormatter{
-        DisableColors: true,
-        FullTimestamp: true,
-    })
-    log.Info("Starting...")
-    NewController()
-}
-
-type Storage interface {
+type storage interface {
     CheckImage(image string) (string, bool)
     PutImage(old, new string)
 }
 
 type event struct {
-    eventType        string
+    eventType        string // Its easier to have one more field than doing reflection each time
     eventObj         watch.Event
     ContainersOrigin []v12.Container
-    ContainersTODO   map[name.Reference]*string
-    Storage          Storage
+    ContainersTODO   map[*name.Reference]*string
+    Storage          storage
+    EventID          uuid.UUID
 }
 
 const (
-    defaultRepo     = "evkuzin"
-    defaultRegistry = "index.docker.io"
-    deployment      = "deployment"
-    daemonset       = "daemonset"
-    kubesystem     = "kube-system"
+    deployment = "deployment"
+    daemonset  = "daemonset"
+    kubesystem = "kube-system"
 )
 
-func NewController() {
+var (
+    defaultRepo     *string
+    defaultRegistry *string
+    logLevel        *string
+)
+
+func main() {
+	log.SetFormatter(&log.TextFormatter{
+		ForceColors:      true,
+		DisableTimestamp: false,
+		FullTimestamp:    true,
+		PadLevelText:     true,
+		QuoteEmptyFields: true,
+	})
+	log.SetReportCaller(true)
+	logLevel = flag.String("log", "info", "logging level")
+	defaultRegistry = flag.String("reg", "index.docker.io", "registry location")
+	defaultRepo = flag.String("repo", "evkuzin", "repository location")
+	switch *logLevel {
+	case "info":
+		log.SetLevel(log.InfoLevel)
+		log.SetReportCaller(false)
+	case "debug":
+		log.SetLevel(log.DebugLevel)
+	default:
+		log.Infof("wrong level setting '%s', set level to info", *logLevel)
+	}
+    flag.Parse()
+
+    log.Info("Starting...")
+    newController()
+}
+
+func newController() {
     config, err := rest.InClusterConfig()
     if err != nil {
         panic(err.Error())
@@ -64,21 +89,25 @@ func NewController() {
     if err != nil {
         panic(err.Error())
     }
-    event := &event{
-        eventType:        "",
-        eventObj:         watch.Event{},
-        ContainersOrigin: nil,
-        ContainersTODO:   nil,
-        Storage: NewInMemoryStorage(),
-    }
+
     for {
+        event := &event{
+            eventType:        "",
+            eventObj:         watch.Event{},
+            ContainersOrigin: nil,
+            ContainersTODO:   nil,
+            Storage:          newInMemoryStorage(),
+            EventID:          uuid.Generate(),
+        }
+
         select {
         case event.eventObj = <-ds.ResultChan():
             event.eventType = daemonset
         case event.eventObj = <-deploys.ResultChan():
             event.eventType = deployment
         }
-        go event.CheckImage().ParseImages().PushImage()//.RefactorManifest(clientset)
+
+        go event.CheckImage().ParseImages().PushImage().RefactorManifest(clientset)
     }
 }
 
@@ -88,23 +117,27 @@ func (e *event) CheckImage() *event {
         case daemonset:
             temp := e.eventObj.Object.(*v1.DaemonSet)
             if temp.Namespace == kubesystem {
-                log.Debugf("DaemonSet %v in %v namespace, skipping...", temp.Name, temp.Namespace)
+                log.WithFields(log.Fields{
+                    "EventID":    e.EventID.String(),
+                    "deployment": temp.Name,
+                    "namespace":  temp.Namespace,
+                    "msg":        "Skipping...",
+                }).Debug()
                 return e
             }
             e.ContainersOrigin = temp.Spec.Template.Spec.Containers
-            for _, c := range temp.Spec.Template.Spec.Containers {
-                log.Infof("DaemonSet %v in %v namespace, container %v with image %v", temp.Name, temp.Namespace, c.Name, c.Image)
-            }
         case deployment:
             temp := e.eventObj.Object.(*v1.Deployment)
             if temp.Namespace == kubesystem {
-                log.Debugf("Deployment %v in %v namespace, skipping...", temp.Name, temp.Namespace)
+                log.WithFields(log.Fields{
+                    "EventID":    e.EventID.String(),
+                    "deployment": temp.Name,
+                    "namespace":  temp.Namespace,
+                    "msg":        "Skipping...",
+                }).Debug()
                 return e
             }
             e.ContainersOrigin = temp.Spec.Template.Spec.Containers
-            for _, c := range temp.Spec.Template.Spec.Containers {
-                log.Infof("Deployment %v in %v namespace, container %v with image %v", temp.Name, temp.Namespace, c.Name, c.Image)
-            }
         }
     }
     return e
@@ -112,17 +145,29 @@ func (e *event) CheckImage() *event {
 
 func (e *event) ParseImages() *event {
     if e.ContainersOrigin != nil {
-        e.ContainersTODO = make(map[name.Reference]*string)
-        for _, currentImage := range e.ContainersOrigin {
+        e.ContainersTODO = make(map[*name.Reference]*string)
+        for idx, currentImage := range e.ContainersOrigin {
             ref, err := name.ParseReference(currentImage.Image)
             if err != nil {
                 panic(err)
             }
             repo := ref.Context().RepositoryStr()
             registry := ref.Context().RegistryStr()
-            if strings.Split(repo, "/")[0] != defaultRepo || registry != defaultRegistry {
-                log.Infof("New container TODO. registry %v, image %v", registry, repo)
-                e.ContainersTODO[ref] = &currentImage.Image
+            if strings.Split(repo, "/")[0] != *defaultRepo || registry != *defaultRegistry {
+                log.WithFields(log.Fields{
+                    "EventID":  e.EventID.String(),
+                    "msg":      "New container TODO",
+                    "registry": registry,
+                    "image":    repo,
+                }).Info()
+                e.ContainersTODO[&ref] = &e.ContainersOrigin[idx].Image
+            } else {
+                log.WithFields(log.Fields{
+                    "EventID":  e.EventID.String(),
+                    "msg":      "Skipping container",
+                    "registry": registry,
+                    "image":    repo,
+                }).Debug()
             }
         }
     }
@@ -133,40 +178,75 @@ func (e *event) PushImage() *event {
     if e.ContainersTODO != nil {
         for ref := range e.ContainersTODO {
             if val, ok := e.Storage.CheckImage(*e.ContainersTODO[ref]); !ok {
-                img, err := remote.Image(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+                img, err := remote.Image(*ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
                 if err != nil {
-                    log.Warnf("Failed to get remote image reference. Err: %s", err)
+                    log.WithFields(log.Fields{
+                        "EventID": e.EventID.String(),
+                        "msg":     "Failed to get remote image reference",
+                        "err":     err,
+                    }).Error()
+                    continue
                 }
                 imgTag, err := img.Digest()
                 if err != nil {
-                    log.Warnf("Failed to get image digest. Err: %s", err)
+                    log.WithFields(log.Fields{
+                        "EventID": e.EventID.String(),
+                        "msg":     "Failed to get image digest",
+                        "err":     err,
+                    }).Error()
+                    continue
                 }
-                imgName := strings.Split(ref.Context().RepositoryStr(), "/")[1]
-                imgName = "imageloader"
-                tag, err := name.NewTag(fmt.Sprintf("%s/%s/%s:%s", defaultRegistry, defaultRepo, imgName, imgTag.Hex))
+                imgName := strings.Split((*ref).Context().RepositoryStr(), "/")[1]
+                tag, err := name.NewTag(fmt.Sprintf("%s/%s/%s:%s", *defaultRegistry, *defaultRepo, imgName, imgTag.Hex))
                 if err != nil {
-                    log.Warnf("Failed to create a new tag. Err: %s", err)
+                    log.WithFields(log.Fields{
+                        "EventID": e.EventID.String(),
+                        "msg":     "Failed to create a new tag",
+                        "err":     err,
+                    }).Error()
+                    continue
                 }
                 err = remote.Write(tag, img, remote.WithAuthFromKeychain(authn.DefaultKeychain))
                 if err != nil {
-                    log.Warnf("Failed to push image. Err: %s", err)
+                    log.WithFields(log.Fields{
+                        "EventID": e.EventID.String(),
+                        "msg":     "Failed to push image",
+                        "err":     err,
+                    }).Error()
+                    continue
                 }
-                log.Infof("Image %s uploaded successfully", tag.Name())
-                e.Storage.PutImage(*e.ContainersTODO[ref], tag.Name())
+                log.WithFields(log.Fields{
+                    "EventID": e.EventID.String(),
+                    "msg":     "Image uploaded successfully",
+                    "Image":   tag.Name(),
+                }).Info()
+                e.Storage.PutImage(*(e.ContainersTODO[ref]), tag.Name())
                 *e.ContainersTODO[ref] = tag.Name()
-                log.Infof("This entity will be updated: %#v", e.eventObj)
             } else {
-                log.Infof("Image %v was upload before. Using uploaded image: %v", *e.ContainersTODO[ref], val)
                 *e.ContainersTODO[ref] = val
+                log.WithFields(log.Fields{
+                    "EventID":  e.EventID.String(),
+                    "msg":      "Image was upload before. Use uploaded image",
+                    "OldImage": (*ref).Name(),
+                    "NewImage": val,
+                }).Info()
             }
         }
+    } else {
+        log.WithFields(log.Fields{
+            "EventID": e.EventID.String(),
+            "msg":     "No containers to proceed",
+        }).Debug()
     }
     return e
 }
 
 func (e *event) RefactorManifest(clientset *kubernetes.Clientset) {
-    if e.ContainersTODO == nil {
-        log.Infof("No containers to proceed")
+    if e.ContainersTODO == nil || len(e.ContainersTODO) == 0 {
+        log.WithFields(log.Fields{
+            "EventID": e.EventID.String(),
+            "msg":     "No containers to proceed",
+        }).Debug()
         return
     }
     switch e.eventType {
@@ -177,16 +257,30 @@ func (e *event) RefactorManifest(clientset *kubernetes.Clientset) {
         retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
             result, getErr := DaemonSetsClient.Get(context.TODO(), dname, metav1.GetOptions{})
             if getErr != nil {
-                log.Errorf("Failed to get latest version of DaemonSet: %v", getErr)
+                log.WithFields(log.Fields{
+                    "EventID": e.EventID.String(),
+                    "msg":     "Failed to get latest version of DaemonSet",
+                    "err":     getErr,
+                }).Error()
+                return getErr
             }
             result.Spec.Template.Spec.Containers = e.ContainersOrigin
             _, updateErr := DaemonSetsClient.Update(context.TODO(), result, metav1.UpdateOptions{})
             return updateErr
         })
         if retryErr != nil {
-            log.Errorf("Update failed: %v", retryErr)
+            log.WithFields(log.Fields{
+                "EventID": e.EventID.String(),
+                "msg":     "Update failed",
+                "err":     retryErr,
+            }).Error()
         }
-        log.Infof("DaemonSet %v in %v namespace was updated", dname, namespace)
+        log.WithFields(log.Fields{
+            "EventID":   e.EventID.String(),
+            "msg":       "DaemonSet was updated",
+            "DaemonSet": dname,
+            "namespace": namespace,
+        }).Info()
     case deployment:
         namespace := e.eventObj.Object.(*v1.Deployment).Namespace
         dname := e.eventObj.Object.(*v1.Deployment).Name
@@ -194,15 +288,35 @@ func (e *event) RefactorManifest(clientset *kubernetes.Clientset) {
         retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
             result, getErr := deploymentsClient.Get(context.TODO(), dname, metav1.GetOptions{})
             if getErr != nil {
-                log.Errorf("Failed to get latest version of Deployment: %v", getErr)
+                log.WithFields(log.Fields{
+                    "EventID": e.EventID.String(),
+                    "msg":     "Failed to get latest version of Deployment",
+                    "err":     getErr,
+                }).Error()
+                return getErr
             }
+
             result.Spec.Template.Spec.Containers = e.ContainersOrigin
+            log.WithFields(log.Fields{
+                "EventID":            e.EventID,
+                "ContainersInit":     result.Spec.Template.Spec.Containers,
+                "ContainersModified": e.ContainersOrigin,
+            }).Debug()
             _, updateErr := deploymentsClient.Update(context.TODO(), result, metav1.UpdateOptions{})
             return updateErr
         })
         if retryErr != nil {
-            log.Errorf("Update failed: %v", retryErr)
+            log.WithFields(log.Fields{
+                "EventID": e.EventID.String(),
+                "msg":     "Update failed",
+                "err":     retryErr,
+            }).Error()
         }
-        log.Infof("Deployment %v in %v namespace was updated", dname, namespace)
+        log.WithFields(log.Fields{
+            "EventID":    e.EventID.String(),
+            "msg":        "Deployment was updated",
+            "Deployment": dname,
+            "namespace":  namespace,
+        }).Info()
     }
 }

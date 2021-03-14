@@ -1,4 +1,32 @@
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: imageloader
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: imagemanagement
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets"]
+    verbs: ["get", "watch", "list", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: imageloader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: imagemanagement
+subjects:
+  - kind: ServiceAccount
+    name: imageloader
+    namespace: default
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -9,7 +37,7 @@ roleRef:
   name: view
 subjects:
   - kind: ServiceAccount
-    name: default
+    name: imageloader
     namespace: default
 ---
 apiVersion: apps/v1
@@ -44,3 +72,4 @@ spec:
         - name: docker-conf
           configMap:
             name: docker-config
+      serviceAccount: imageloader

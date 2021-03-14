@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docker-config
+data:
+  config.json: |
+    {
+      "auths": {
+        "https://index.docker.io/v1/": {
+          "auth": ""
+        }
+      }
+    }
